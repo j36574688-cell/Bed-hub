@@ -27,13 +27,10 @@ st.set_page_config(
 def init_db():
     """初始化資料庫結構 (含 WAL 優化與 Index)"""
     with sqlite3.connect(DB_PATH) as conn:
-        # [NEW] 啟用 WAL 模式，提升穩定性
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         
         cur = conn.cursor()
-        
-        # 1. 注單表 (新增 notes 欄位)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bets (
             id TEXT PRIMARY KEY,
@@ -47,19 +44,13 @@ def init_db():
             settled_at TEXT,
             notes TEXT
         )""")
-        
-        # [NEW] 2. 索引優化
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_created ON bets(created_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);")
-        
-        # 3. 設定表
         cur.execute("""
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value REAL
         )""")
-        
-        # [NEW] 4. 審計日誌 (Audit Log)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,8 +59,6 @@ def init_db():
             target_id TEXT,
             payload TEXT
         )""")
-        
-        # 初始化本金
         cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('bankroll', 10000.0)")
         cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('initial', 10000.0)")
         conn.commit()
@@ -77,9 +66,10 @@ def init_db():
 def log_audit(conn, action, target_id, payload):
     """寫入審計日誌 (內部呼叫)"""
     ts = datetime.datetime.now(TZ_TAIPEI).isoformat()
+    # [FIX] 確保 payload 可以被 JSON 序列化
     conn.execute(
         "INSERT INTO audit_log (ts, action, target_id, payload) VALUES (?, ?, ?, ?)",
-        (ts, action, target_id, json.dumps(payload, ensure_ascii=False))
+        (ts, action, target_id, json.dumps(payload, ensure_ascii=False, default=str)) 
     )
 
 def get_config():
@@ -105,7 +95,6 @@ def add_bet_db(match, bet_type, stake, odds, notes=""):
     
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        # 防重複檢查
         cur.execute("""
             SELECT id FROM bets 
             WHERE match_info=? AND bet_type=? AND stake=? AND odds=? AND status='待定'
@@ -123,35 +112,35 @@ def add_bet_db(match, bet_type, stake, odds, notes=""):
         return True, bet_id
 
 def settle_bet_db(bet_id, profit, status):
-    """結算注單 (交易原子性)"""
+    """結算注單 (修復 Decimal JSON Error)"""
     now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
     
+    # [FIX] 強制轉為 float，避免 Decimal 導致 JSON 報錯
+    profit_val = float(profit)
+
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
-            cur.execute("BEGIN") # 顯式開啟交易
+            cur.execute("BEGIN")
             
-            # 1. 檢查並鎖定狀態
             cur.execute("SELECT profit, status FROM bets WHERE id=?", (bet_id,))
             row = cur.fetchone()
             if not row: return False
             old_profit = row[0]
             
-            # 2. 更新注單
             cur.execute("""
                 UPDATE bets 
                 SET status=?, profit=?, settled_at=? 
                 WHERE id=?
-            """, (status, float(profit), now_iso, bet_id))
+            """, (status, profit_val, now_iso, bet_id))
             
-            # 3. 更新本金 (扣除舊盈虧，加入新盈虧 -> 支援重新結算)
             cur.execute("SELECT value FROM config WHERE key='bankroll'")
             current_bank = cur.fetchone()[0]
-            # 邏輯：新本金 = 當前本金 - 舊盈虧(若有) + 新盈虧
-            new_bank = current_bank - old_profit + float(profit)
+            new_bank = current_bank - old_profit + profit_val
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (new_bank,))
             
-            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit, "old_profit": old_profit})
+            # 使用轉換過的 profit_val
+            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit_val, "old_profit": old_profit})
             conn.commit()
             return True
         except Exception as e:
@@ -159,7 +148,7 @@ def settle_bet_db(bet_id, profit, status):
             raise e
 
 def revoke_settlement_db(bet_id):
-    """[NEW] 撤銷結算 (反悔藥)"""
+    """撤銷結算"""
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
@@ -170,10 +159,8 @@ def revoke_settlement_db(bet_id):
             if not row: return False
             profit_to_remove = row[0]
             
-            # 回滾狀態
             cur.execute("UPDATE bets SET status='待定', profit=0, settled_at=NULL WHERE id=?", (bet_id,))
             
-            # 回滾本金
             cur.execute("SELECT value FROM config WHERE key='bankroll'")
             current_bank = cur.fetchone()[0]
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (current_bank - profit_to_remove,))
@@ -219,7 +206,6 @@ def calculate_pnl(stake, odds, result_code):
     return d_profit.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 def calculate_max_drawdown(equity_curve):
-    """[NEW] 計算最大回撤"""
     if not equity_curve: return 0.0
     peak = equity_curve[0]
     max_dd = 0.0
@@ -232,32 +218,97 @@ def calculate_max_drawdown(equity_curve):
     return max_dd * 100
 
 # ==========================================
-# 🎨 3. UI 樣式
+# 🎨 3. UI 樣式 (鈦金版)
 # ==========================================
 st.markdown("""
 <style>
-    .stApp { background-color: #0E1117; color: #FAFAFA; }
-    .hud-container {
-        background: linear-gradient(90deg, #1F2937 0%, #111827 100%);
-        border: 1px solid #374151;
-        border-radius: 12px;
-        padding: 15px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        text-align: center;
-        border-left: 5px solid #00C853;
+    /* === 鈦金版全局配色 (Titanium Edition) === */
+    .stApp { 
+        background-color: #000000; 
+        color: #E5E7EB; 
     }
-    .hud-title { font-size: 12px; color: #9CA3AF; letter-spacing: 1px; text-transform: uppercase; }
-    .hud-value { font-size: 32px; font-weight: 800; color: #FFFFFF; font-family: 'Courier New', monospace; }
-    .hud-sub { font-size: 14px; color: #34D399; font-weight: bold; }
-    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label { color: #E5E7EB !important; font-weight: bold; }
-    .stButton > button { width: 100%; border-radius: 8px; height: 50px; font-weight: bold; border: none; transition: all 0.2s; }
-    .primary-btn button { background-color: #2563EB !important; color: white !important; box-shadow: 0 4px 14px 0 rgba(37, 99, 235, 0.39); }
-    .win-btn button { background-color: #059669 !important; color: white !important; }
-    .lose-btn button { background-color: #DC2626 !important; color: white !important; }
-    .push-btn button { background-color: #D97706 !important; color: white !important; }
-    .revoke-btn button { background-color: #4B5563 !important; color: white !important; border: 1px solid #6B7280; }
-    [data-testid="stSidebar"] { background-color: #111827; border-right: 1px solid #374151; }
+    
+    /* 頂部 HUD：改為黑金漸層 + 金色邊框 */
+    .hud-container {
+        background: linear-gradient(135deg, #1C1917 0%, #292524 100%);
+        border: 1px solid #44403C;
+        border-bottom: 4px solid #F59E0B; /* 琥珀金 */
+        border-radius: 4px;
+        padding: 20px;
+        margin-bottom: 25px;
+        box-shadow: 0 10px 15px -3px rgba(245, 158, 11, 0.1);
+        text-align: center;
+        font-family: 'Helvetica Neue', sans-serif;
+    }
+    .hud-title { 
+        font-size: 11px; 
+        color: #D97706; /* 暗金 */
+        letter-spacing: 2px; 
+        text-transform: uppercase; 
+        font-weight: 700;
+        margin-bottom: 5px;
+    }
+    .hud-value { 
+        font-size: 36px; 
+        font-weight: 900; 
+        color: #F3F4F6; 
+        text-shadow: 0 0 10px rgba(245, 158, 11, 0.3);
+    }
+    .hud-sub { 
+        font-size: 14px; 
+        color: #10B981; 
+        font-family: monospace; 
+        background: #064E3B;
+        padding: 2px 8px;
+        border-radius: 4px;
+        display: inline-block;
+        margin-top: 5px;
+    }
+    
+    /* 輸入框優化 */
+    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label { 
+        color: #D1D5DB !important; 
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    /* 按鈕樣式重寫 */
+    .stButton > button { 
+        width: 100%; 
+        border-radius: 2px;
+        height: 45px; 
+        font-weight: 700; 
+        border: 1px solid rgba(255,255,255,0.1); 
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        transition: all 0.2s;
+    }
+    
+    /* 主行動按鈕：鈦金色 */
+    .primary-btn button { 
+        background: linear-gradient(to bottom, #F59E0B, #D97706) !important; 
+        color: #000000 !important; 
+        border: none !important;
+        box-shadow: 0 0 15px rgba(245, 158, 11, 0.4);
+    }
+    .primary-btn button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 0 20px rgba(245, 158, 11, 0.6);
+    }
+    
+    /* 贏/輸按鈕 */
+    .win-btn button { background-color: #065F46 !important; color: #D1FAE5 !important; border-left: 3px solid #10B981 !important; }
+    .lose-btn button { background-color: #7F1D1D !important; color: #FEE2E2 !important; border-left: 3px solid #EF4444 !important; }
+    .push-btn button { background-color: #78350F !important; color: #FEF3C7 !important; border-left: 3px solid #F59E0B !important; }
+    .revoke-btn button { background-color: #262626 !important; color: #9CA3AF !important; border: 1px solid #404040 !important; font-size: 12px; }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 0px; }
+    .stTabs [data-baseweb="tab"] { background-color: #000000; color: #525252; border-bottom: 1px solid #262626; padding: 15px 0; }
+    .stTabs [aria-selected="true"] { color: #F59E0B !important; border-bottom: 2px solid #F59E0B; background-color: #1C1917; }
+    
+    [data-testid="stSidebar"] { background-color: #0A0A0A; border-right: 1px solid #262626; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -311,13 +362,8 @@ with st.sidebar:
     if batch_file and st.button("⚡ 執行批次結算"):
         try:
             df_batch = pd.read_csv(batch_file)
-            count = 0
-            for _, row in df_batch.iterrows():
-                # 需先查詢該單詳情計算 profit (略為簡化，需有 id, result)
-                # 這裡僅作範例框架，實際需結合 DB 查詢
-                st.warning("請確保 CSV 包含 id 與 result 欄位")
-                break 
-            st.success(f"批次處理完成")
+            st.warning("批次功能需要對應的 ID 列表")
+            st.success(f"CSV 上傳成功，請確認 ID 正確")
         except:
             st.error("CSV 格式錯誤")
 
@@ -333,7 +379,7 @@ with st.sidebar:
     }
     st.download_button(
         label="📥 匯出資料庫 (JSON)",
-        data=json.dumps(export_data, ensure_ascii=False, indent=2),
+        data=json.dumps(export_data, ensure_ascii=False, indent=2, default=str),
         file_name=f"sniper_v8_backup.json",
         mime="application/json"
     )
@@ -345,7 +391,7 @@ with st.sidebar:
         st.toast("系統已完全重置", icon="💥")
         st.rerun()
         
-    st.caption("Sniper Bet Pro v8.0 (Titanium)")
+    st.caption("Sniper Bet Pro v8.1 (Titanium Patch)")
 
 # ==========================================
 # 🖥️ 6. 主畫面
@@ -399,7 +445,6 @@ with tab1:
     with c1: stake = st.number_input("投入金額", value=1000, step=100)
     with c2: odds = st.number_input("賠率 (Odds)", value=1.90, step=0.01)
     
-    # [NEW] 戰術備註
     notes = st.text_input("戰術筆記 (選填)", placeholder="例如：主隊主力受傷，看好小球...")
 
     if stake > 0 and odds > 1.0:
@@ -466,7 +511,6 @@ with tab2:
             p = calculate_pnl(target_bet['stake'], target_bet['odds'], "輸半")
             settle_bet_db(bid, p, "輸半"); st.rerun()
 
-    # [NEW] 撤銷結算區 (Recent Settled)
     st.markdown("---")
     st.markdown("#### ↩️ 近期已結算 (可撤銷)")
     df_settled_recent = pd.read_sql_query("SELECT * FROM bets WHERE status != '待定' ORDER BY settled_at DESC LIMIT 5", sqlite3.connect(DB_PATH))
@@ -507,7 +551,6 @@ with tab3:
                 equity_curve.append(curr_initial + cum_profit)
                 dates.append(r['sort_time'].strftime("%m/%d"))
             
-            # [NEW] 最大回撤計算
             max_dd = calculate_max_drawdown(equity_curve)
             
             st.line_chart(pd.DataFrame({'Equity': equity_curve}, index=dates))
@@ -519,7 +562,7 @@ with tab3:
             
             c1, c2, c3 = st.columns(3)
             c1.metric("Win Rate", f"{win_rate:.1f}%")
-            c2.metric("Max Drawdown", f"{max_dd:.1f}%", help="最大回撤：資金從最高點回落的幅度")
+            c2.metric("Max Drawdown", f"{max_dd:.1f}%", help="最大回撤")
             c3.metric("ROI", f"{roi:.1f}%")
         else:
             st.info("尚無結算數據")
