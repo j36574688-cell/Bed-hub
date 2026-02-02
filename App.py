@@ -1,13 +1,18 @@
 import streamlit as st
-import json
-import os
+import sqlite3
 import pandas as pd
 import datetime
 import uuid
+import json
+from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
 # ==========================================
-# ⚙️ 1. 頁面配置與戰術風格 CSS
+# ⚙️ 0. 核心設定與常數
 # ==========================================
+DB_PATH = "sniper.db"
+TZ_TAIPEI = ZoneInfo("Asia/Taipei")
+
 st.set_page_config(
     page_title="SNIPER BETTING PRO",
     page_icon="🎯",
@@ -15,12 +20,163 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# ==========================================
+# 🛠 1. 資料庫層 (SQLite + Atomic)
+# ==========================================
+def init_db():
+    """初始化資料庫結構"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        # 注單表
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bets (
+            id TEXT PRIMARY KEY,
+            created_at TEXT,
+            match_info TEXT,
+            bet_type TEXT,
+            stake REAL,
+            odds REAL,
+            status TEXT,
+            profit REAL,
+            settled_at TEXT
+        )""")
+        # 設定表 (本金)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value REAL
+        )""")
+        # 初始化本金 (若不存在)
+        cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('bankroll', 10000.0)")
+        cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('initial', 10000.0)")
+        conn.commit()
+
+def get_config():
+    """讀取資金設定"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM config")
+        data = dict(cur.fetchall())
+        return data.get('bankroll', 10000.0), data.get('initial', 10000.0)
+
+def update_config(bankroll=None, initial=None):
+    """更新資金設定"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        if bankroll is not None:
+            cur.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('bankroll', ?)", (bankroll,))
+        if initial is not None:
+            cur.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('initial', ?)", (initial,))
+        conn.commit()
+
+def add_bet_db(match, bet_type, stake, odds):
+    """新增注單 (含防重複檢查)"""
+    now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
+    bet_id = str(uuid.uuid4())
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        # 防重複檢查 (簡單邏輯：同比賽、同玩法、同金額、同賠率，且在最近 10 秒內)
+        # 這裡簡化為檢查是否已存在完全相同的未結算注單
+        cur.execute("""
+            SELECT id FROM bets 
+            WHERE match_info=? AND bet_type=? AND stake=? AND odds=? AND status='待定'
+        """, (match, bet_type, stake, odds))
+        if cur.fetchone():
+            return False, "⚠️ 偵測到重複注單，操作已攔截！"
+
+        cur.execute("""
+            INSERT INTO bets (id, created_at, match_info, bet_type, stake, odds, status, profit, settled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (bet_id, now_iso, match, bet_type, stake, odds, '待定', 0.0, None))
+        conn.commit()
+        return True, bet_id
+
+def settle_bet_db(bet_id, profit, status):
+    """結算注單 (Transaction)"""
+    now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        
+        # 1. 獲取該注單當前狀態，避免重複結算
+        cur.execute("SELECT profit, status FROM bets WHERE id=?", (bet_id,))
+        row = cur.fetchone()
+        if not row: return False
+        
+        # 若已結算過，先回滾舊的盈虧 (這是進階功能，簡單起見這裡假設只處理待定，或是覆蓋)
+        # 這裡我們做簡單的覆蓋邏輯：直接更新
+        
+        # 2. 更新注單
+        cur.execute("""
+            UPDATE bets 
+            SET status=?, profit=?, settled_at=? 
+            WHERE id=?
+        """, (status, float(profit), now_iso, bet_id))
+        
+        # 3. 更新本金 (讀取 -> 計算 -> 寫入)
+        cur.execute("SELECT value FROM config WHERE key='bankroll'")
+        current_bank = cur.fetchone()[0]
+        new_bank = current_bank + float(profit)
+        cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (new_bank,))
+        
+        conn.commit()
+        return True
+
+def get_all_bets():
+    """獲取所有注單"""
+    with sqlite3.connect(DB_PATH) as conn:
+        # 使用 pandas 讀取，方便後續處理
+        return pd.read_sql_query("SELECT * FROM bets ORDER BY created_at ASC", conn)
+
+def reset_system_db():
+    """重置系統"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM bets")
+        cur.execute("UPDATE config SET value=10000.0 WHERE key='bankroll'")
+        cur.execute("UPDATE config SET value=10000.0 WHERE key='initial'")
+        conn.commit()
+
+# 初始化 DB
+init_db()
+
+# ==========================================
+# 🧠 2. 商業邏輯 (Decimal 精度計算)
+# ==========================================
+def calculate_pnl(stake, odds, result_code):
+    """
+    使用 Decimal 進行精確計算
+    stake: float
+    odds: float
+    """
+    d_stake = Decimal(str(stake))
+    d_odds = Decimal(str(odds))
+    d_profit = Decimal('0.0')
+
+    if result_code == "贏":
+        d_profit = d_stake * (d_odds - Decimal('1'))
+    elif result_code == "贏半":
+        d_profit = (d_stake * (d_odds - Decimal('1'))) / Decimal('2')
+    elif result_code == "輸":
+        d_profit = -d_stake
+    elif result_code == "輸半":
+        d_profit = -d_stake / Decimal('2')
+    elif result_code == "走水":
+        d_profit = Decimal('0.0')
+    
+    # 四捨五入到小數點後兩位
+    return d_profit.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+# ==========================================
+# 🎨 3. UI 樣式與配置
+# ==========================================
 st.markdown("""
 <style>
-    /* 全局背景色 - 深灰戰術黑 */
+    /* 戰術黑底 */
     .stApp { background-color: #0E1117; color: #FAFAFA; }
     
-    /* 頂部 HUD 儀表板 */
+    /* HUD */
     .hud-container {
         background: linear-gradient(90deg, #1F2937 0%, #111827 100%);
         border: 1px solid #374151;
@@ -35,23 +191,22 @@ st.markdown("""
     .hud-value { font-size: 32px; font-weight: 800; color: #FFFFFF; font-family: 'Courier New', monospace; }
     .hud-sub { font-size: 14px; color: #34D399; font-weight: bold; }
     
-    /* 介面優化 */
-    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label { color: #E5E7EB !important; font-weight: bold; }
+    /* 元件優化 */
+    .stSelectbox label, .stNumberInput label, .stRadio label { color: #E5E7EB !important; font-weight: bold; }
     .stButton > button { width: 100%; border-radius: 8px; height: 50px; font-weight: bold; border: none; transition: all 0.2s; }
     
-    /* 按鈕色系 */
+    /* 按鈕顏色 */
     .primary-btn button { background-color: #2563EB !important; color: white !important; box-shadow: 0 4px 14px 0 rgba(37, 99, 235, 0.39); }
     .win-btn button { background-color: #059669 !important; color: white !important; }
     .lose-btn button { background-color: #DC2626 !important; color: white !important; }
     .push-btn button { background-color: #D97706 !important; color: white !important; }
     
-    /* 側邊欄 */
     [data-testid="stSidebar"] { background-color: #111827; border-right: 1px solid #374151; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🔒 2. GLOBAL_DB 資料庫 (定版不更動)
+# 🔒 4. GLOBAL_DB (定版資料庫)
 # ==========================================
 GLOBAL_DB = {
     "[英] 英超 (Premier League)": ["曼城", "兵工廠", "利物浦", "阿斯頓維拉", "熱刺", "切爾西", "紐卡索聯", "曼聯", "西漢姆聯", "水晶宮", "布萊頓", "伯恩茅斯", "富勒姆", "狼隊", "艾佛頓", "布倫特福德", "諾丁漢森林", "萊斯特城", "伊普斯維奇", "南安普頓"],
@@ -79,95 +234,18 @@ GLOBAL_DB = {
 }
 
 # ==========================================
-# 💾 3. 永續資料管理 (Persistence)
+# 📱 5. 側邊欄 (設定與管理)
 # ==========================================
-DATA_FILE = "bets.json"
+# 每次重新渲染時，從 DB 獲取最新本金
+curr_bankroll, curr_initial = get_config()
 
-def load_data():
-    """啟動時載入資料"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get('records', []), data.get('bankroll', 10000.0), data.get('initial', 10000.0)
-        except:
-            pass
-    return [], 10000.0, 10000.0
-
-def save_data():
-    """變更時存入硬碟"""
-    data = {
-        'records': st.session_state.records,
-        'bankroll': st.session_state.bankroll,
-        'initial': st.session_state.initial_capital
-    }
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-# 初始化 Session State
-if 'records' not in st.session_state:
-    recs, bank, init_cap = load_data()
-    st.session_state.records = recs
-    st.session_state.bankroll = bank
-    st.session_state.initial_capital = init_cap
-
-# ==========================================
-# 🧠 4. 核心邏輯 (Logic)
-# ==========================================
-
-def add_bet(league, home, away, bet_str, stake, odds):
-    clean_league = league.split('] ')[1].split(' (')[0] if ']' in league else league
-    
-    # [NEW] 使用 UUID 確保唯一性
-    # [NEW] 使用 isoformat 儲存標準時間
-    new_rec = {
-        "id": str(uuid.uuid4()), 
-        "date": datetime.datetime.now().isoformat(),
-        "match": f"[{clean_league}] {home} vs {away}",
-        "type": bet_str,
-        "stake": stake,
-        "odds": odds,
-        "status": "待定",
-        "profit": 0
-    }
-    st.session_state.records.append(new_rec)
-    save_data() # [NEW] 自動存檔
-
-def settle_bet(bid, res_code):
-    for r in st.session_state.records:
-        if r['id'] == bid:
-            s, o = float(r['stake']), float(r['odds'])
-            p = 0.0
-            
-            # [NEW] 走水邏輯 (Push)
-            if res_code == "贏": p = s * (o - 1)
-            elif res_code == "贏半": p = (s * (o - 1)) / 2
-            elif res_code == "輸": p = -s
-            elif res_code == "輸半": p = -s / 2
-            elif res_code == "走水": p = 0.0 
-            
-            r['status'] = res_code
-            r['profit'] = p
-            # [NEW] 記錄結算時間，用於報表排序
-            r['settled_at'] = datetime.datetime.now().isoformat()
-            
-            st.session_state.bankroll += p
-            save_data() # [NEW] 自動存檔
-            return p
-    return 0.0
-
-# ==========================================
-# ⚙️ 5. 側邊欄 (資料管理)
-# ==========================================
 with st.sidebar:
     st.header("⚙️ 總部指令 (HQ)")
     
     st.markdown("### 💰 資金修正")
-    new_capital = st.number_input("校正本金", value=float(st.session_state.bankroll), step=1000.0)
+    new_capital = st.number_input("校正本金", value=float(curr_bankroll), step=1000.0)
     if st.button("💾 更新水位"):
-        st.session_state.bankroll = new_capital
-        st.session_state.initial_capital = new_capital
-        save_data()
+        update_config(bankroll=new_capital, initial=new_capital)
         st.toast(f"本金已更新為 ${new_capital:,.0f}", icon="✅")
         st.rerun()
 
@@ -175,63 +253,67 @@ with st.sidebar:
 
     st.markdown("### 📂 資料傳輸")
     
-    # [NEW] 匯出功能
+    # 匯出 (Export)
+    df_all = get_all_bets()
+    export_data = {
+        "records": df_all.to_dict(orient='records'),
+        "bankroll": curr_bankroll,
+        "initial": curr_initial,
+        "export_time": datetime.datetime.now(TZ_TAIPEI).isoformat()
+    }
     st.download_button(
-        label="📥 匯出備份 (JSON)",
-        data=json.dumps({'records': st.session_state.records, 'bankroll': st.session_state.bankroll}, ensure_ascii=False, indent=2),
-        file_name=f"sniper_backup_{datetime.datetime.now().strftime('%Y%m%d')}.json",
+        label="📥 匯出資料庫 (JSON)",
+        data=json.dumps(export_data, ensure_ascii=False, indent=2),
+        file_name=f"sniper_db_{datetime.datetime.now(TZ_TAIPEI).strftime('%Y%m%d')}.json",
         mime="application/json"
     )
 
-    # [NEW] 匯入功能
-    uploaded_file = st.file_uploader("📤 匯入紀錄", type=['json'])
+    # 匯入 (Import) - 支援覆蓋
+    uploaded_file = st.file_uploader("📤 匯入備份", type=['json'])
     if uploaded_file is not None:
         try:
             data = json.load(uploaded_file)
-            st.session_state.records = data.get('records', [])
-            st.session_state.bankroll = data.get('bankroll', 10000.0)
-            save_data()
-            st.success("資料匯入成功！")
-            st.rerun()
-        except:
-            st.error("檔案格式錯誤")
+            # 危險操作：清空舊資料並匯入
+            if st.button("確認覆蓋匯入"):
+                reset_system_db()
+                update_config(bankroll=data.get('bankroll', 10000.0), initial=data.get('initial', 10000.0))
+                # 寫入注單
+                for r in data.get('records', []):
+                    # 直接寫入 DB，忽略檢查 (因為是備份恢復)
+                    with sqlite3.connect(DB_PATH) as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT OR REPLACE INTO bets (id, created_at, match_info, bet_type, stake, odds, status, profit, settled_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (r['id'], r['created_at'], r['match_info'], r['bet_type'], r['stake'], r['odds'], r['status'], r['profit'], r.get('settled_at')))
+                        conn.commit()
+                st.success("資料還原成功！")
+                st.rerun()
+        except Exception as e:
+            st.error(f"檔案錯誤: {e}")
 
     st.divider()
 
-    # [NEW] 安全重置 (需勾選確認)
     st.markdown("### 🚨 危險區域")
-    confirm_reset = st.checkbox("我確認要清除所有資料")
+    confirm_reset = st.checkbox("確認清除所有資料")
     if st.button("⚠️ 初始化系統", type="primary", disabled=not confirm_reset):
-        # [NEW] 備份機制 (Undo)
-        st.session_state.last_backup = st.session_state.records.copy()
-        
-        st.session_state.records = []
-        st.session_state.bankroll = 10000.0
-        st.session_state.initial_capital = 10000.0
-        save_data()
-        st.toast("系統已重置", icon="💥")
+        reset_system_db()
+        st.toast("系統已完全重置", icon="💥")
         st.rerun()
         
-    # [NEW] 還原按鈕
-    if 'last_backup' in st.session_state and st.session_state.last_backup:
-        if st.button("↩️ 復原刪除"):
-            st.session_state.records = st.session_state.last_backup
-            save_data()
-            del st.session_state.last_backup
-            st.success("資料已復原")
-            st.rerun()
+    st.caption("Sniper Bet Pro v7.0 (SQLite)")
 
 # ==========================================
-# 📱 6. 主畫面 (HUD & Tabs)
+# 🖥️ 6. 主畫面
 # ==========================================
-total_profit = st.session_state.bankroll - st.session_state.initial_capital
+total_profit = curr_bankroll - curr_initial
 p_color = "#34D399" if total_profit >= 0 else "#EF4444"
 p_sign = "+" if total_profit >= 0 else ""
 
 st.markdown(f"""
 <div class="hud-container">
     <div class="hud-title">CURRENT BANKROLL</div>
-    <div class="hud-value">${st.session_state.bankroll:,.0f}</div>
+    <div class="hud-value">${curr_bankroll:,.0f}</div>
     <div class="hud-sub" style="color: {p_color};">PROFIT: {p_sign}${total_profit:,.0f}</div>
 </div>
 """, unsafe_allow_html=True)
@@ -276,110 +358,138 @@ with tab1:
     with c1: stake = st.number_input("投入金額", value=1000, step=100)
     with c2: odds = st.number_input("賠率 (Odds)", value=1.90, step=0.01)
 
-    # [NEW] 即時預覽 & 驗證
-    potential_win = stake * (odds - 1)
-    st.caption(f"預估獲利: :green[+${potential_win:,.0f}]")
+    # 即時計算預估獲利
+    if stake > 0 and odds > 1.0:
+        pot_win = calculate_pnl(stake, odds, "贏")
+        st.caption(f"🎯 預估獲利: :green[+${pot_win:,.2f}]")
 
     st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
     
-    if stake <= 0 or odds <= 1.0:
-        st.error("⚠️ 請輸入有效的金額與賠率")
-    else:
-        if st.button("🚀 LOCK IN BET (鎖定注單)"):
-            add_bet(league, home, away, bet_content, stake, odds)
+    if st.button("🚀 LOCK IN BET (鎖定注單)"):
+        clean_league = league.split('] ')[1].split(' (')[0] if ']' in league else league
+        match_info = f"[{clean_league}] {home} vs {away}"
+        
+        success, msg = add_bet_db(match_info, bet_content, stake, odds)
+        if success:
             st.success(f"TARGET ACQUIRED: {home} vs {away}")
+            st.rerun()
+        else:
+            st.error(msg)
+            
     st.markdown('</div>', unsafe_allow_html=True)
 
 # === TAB 2: 結算 ===
 with tab2:
-    pending = [r for r in st.session_state.records if r['status'] == '待定']
-    if not pending:
+    # 讀取待結算注單
+    df_pending = pd.read_sql_query("SELECT * FROM bets WHERE status='待定' ORDER BY created_at DESC", sqlite3.connect(DB_PATH))
+    
+    if df_pending.empty:
         st.info("NO ACTIVE TARGETS (無進行中賽事)")
     else:
-        # [NEW] 顯示優化：加入日期
+        # 顯示日期以便辨識
         opts = {}
-        for r in pending:
-            d_str = pd.to_datetime(r['date']).strftime("%m/%d")
-            label = f"[{d_str}] {r['match']} ({r['type']}) ${r['stake']}"
+        for _, r in df_pending.iterrows():
+            # 將 ISO 時間轉為可讀格式
+            dt = datetime.datetime.fromisoformat(r['created_at']).strftime("%m/%d %H:%M")
+            label = f"[{dt}] {r['match_info']} ({r['bet_type']}) ${r['stake']:.0f}"
             opts[label] = r['id']
-            
+
         sel_label = st.selectbox("選擇結算目標", list(opts.keys()))
         bid = opts[sel_label]
+        
+        # 找出選中注單的詳細資訊 (stake, odds)
+        target_bet = df_pending[df_pending['id'] == bid].iloc[0]
         
         st.markdown("### MISSION OUTCOME")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown('<div class="win-btn">', unsafe_allow_html=True)
             if st.button("✅ WIN (全贏)"):
-                settle_bet(bid, "贏"); st.rerun()
+                p = calculate_pnl(target_bet['stake'], target_bet['odds'], "贏")
+                settle_bet_db(bid, p, "贏")
+                st.toast(f"MISSION SUCCESS! +${p}", icon="💰")
+                st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
         with c2:
             st.markdown('<div class="lose-btn">', unsafe_allow_html=True)
             if st.button("❌ LOSS (全輸)"):
-                settle_bet(bid, "輸"); st.rerun()
+                p = calculate_pnl(target_bet['stake'], target_bet['odds'], "輸")
+                settle_bet_db(bid, p, "輸")
+                st.toast(f"MISSION FAILED. ${p}", icon="🥀")
+                st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
-        
-        # [NEW] 加入走水按鈕
+            
         c3, c4, c5 = st.columns(3)
-        if c3.button("💵 贏半"): settle_bet(bid, "贏半"); st.rerun()
+        if c3.button("💵 贏半"):
+            p = calculate_pnl(target_bet['stake'], target_bet['odds'], "贏半")
+            settle_bet_db(bid, p, "贏半")
+            st.rerun()
         with c4:
              st.markdown('<div class="push-btn">', unsafe_allow_html=True)
-             if st.button("🔄 走水"): settle_bet(bid, "走水"); st.rerun()
+             if st.button("🔄 走水"):
+                 p = calculate_pnl(target_bet['stake'], target_bet['odds'], "走水")
+                 settle_bet_db(bid, p, "走水")
+                 st.rerun()
              st.markdown('</div>', unsafe_allow_html=True)
-        if c5.button("💸 輸半"): settle_bet(bid, "輸半"); st.rerun()
+        if c5.button("💸 輸半"):
+            p = calculate_pnl(target_bet['stake'], target_bet['odds'], "輸半")
+            settle_bet_db(bid, p, "輸半")
+            st.rerun()
 
 # === TAB 3: 報表 ===
 with tab3:
-    # [NEW] 篩選器
-    all_leagues = sorted(list(set([r['match'].split(']')[0].replace('[', '') for r in st.session_state.records]))) if st.session_state.records else []
+    df_all = get_all_bets()
+    
+    # 篩選器
+    all_leagues = sorted(list(set([r.split(']')[0].replace('[', '') for r in df_all['match_info']]))) if not df_all.empty else []
     filter_lg = st.selectbox("Filter League", ["All"] + all_leagues)
     
-    filtered_records = st.session_state.records
     if filter_lg != "All":
-        filtered_records = [r for r in filtered_records if filter_lg in r['match']]
+        df_all = df_all[df_all['match_info'].str.contains(filter_lg)]
 
-    if len(filtered_records) > 0:
-        # [NEW] 時間序列修正邏輯
-        settled_recs = [r for r in filtered_records if r['status'] != '待定']
+    if not df_all.empty:
+        # 時間序列圖表準備
+        # 只取已結算
+        df_settled = df_all[df_all['status'] != '待定'].copy()
         
-        if settled_recs:
-            df_settled = pd.DataFrame(settled_recs)
-            # 優先使用結算時間，若無則用下注時間
-            time_col = 'settled_at' if 'settled_at' in df_settled.columns else 'date'
-            df_settled[time_col] = pd.to_datetime(df_settled[time_col])
-            df_settled = df_settled.sort_values(time_col)
+        if not df_settled.empty:
+            # 優先用結算時間排序
+            df_settled['sort_time'] = pd.to_datetime(df_settled['settled_at'])
+            df_settled = df_settled.sort_values('sort_time')
             
-            equity = [st.session_state.initial_capital]
+            # 計算累積損益
+            equity_curve = [curr_initial]
             dates = ["Start"]
             
-            for _, row in df_settled.iterrows():
-                equity.append(equity[-1] + row['profit'])
-                # 簡化日期顯示
-                dates.append(row[time_col].strftime("%m/%d"))
+            cum_profit = 0
+            for _, r in df_settled.iterrows():
+                cum_profit += r['profit']
+                equity_curve.append(curr_initial + cum_profit)
+                dates.append(r['sort_time'].strftime("%m/%d"))
             
-            chart_data = pd.DataFrame({'Equity': equity}, index=dates)
-            st.line_chart(chart_data)
+            # 繪圖
+            st.line_chart(pd.DataFrame({'Equity': equity_curve}, index=dates))
             
-            # 計算數據
-            wins = (df_settled['profit'] > 0).sum()
-            total = len(df_settled)
-            win_rate = (wins / total * 100) if total > 0 else 0
-            curr_equity = equity[-1]
-            roi = ((curr_equity - st.session_state.initial_capital) / st.session_state.initial_capital * 100)
-
+            # 統計數據
+            total_settled = len(df_settled)
+            wins = len(df_settled[df_settled['profit'] > 0])
+            win_rate = (wins / total_settled * 100) if total_settled > 0 else 0
+            roi = ((equity_curve[-1] - curr_initial) / curr_initial * 100)
+            
             c1, c2, c3 = st.columns(3)
             c1.metric("Win Rate", f"{win_rate:.1f}%")
-            c2.metric("Trades", f"{total}")
+            c2.metric("Trades", f"{total_settled}")
             c3.metric("ROI", f"{roi:.1f}%")
         else:
-            st.info("尚未有結算紀錄")
+            st.info("尚無結算數據")
 
+        # 詳細報表
         st.markdown("### 📜 Mission Log")
-        # 顯示所有紀錄 (含待定)
-        df_all = pd.DataFrame(filtered_records)
-        # 格式化顯示
-        df_show = df_all[['date', 'match', 'type', 'status', 'profit']].copy()
-        df_show['date'] = pd.to_datetime(df_show['date']).dt.strftime("%m/%d %H:%M")
+        # 格式化顯示時間
+        df_show = df_all[['created_at', 'match_info', 'bet_type', 'status', 'profit', 'stake', 'odds']].copy()
+        df_show['created_at'] = pd.to_datetime(df_show['created_at']).dt.strftime("%m/%d %H:%M")
+        # 重新命名欄位以便閱讀
+        df_show.columns = ['Time', 'Match', 'Bet', 'Status', 'P/L', 'Stake', 'Odds']
         st.dataframe(df_show, use_container_width=True)
     else:
         st.write("Awaiting Data...")
