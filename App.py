@@ -25,12 +25,11 @@ st.set_page_config(
 # 🛠 1. 資料庫層 (SQLite + WAL + Audit)
 # ==========================================
 def init_db():
-    """初始化資料庫結構 (含 WAL 優化與 Index)"""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        
         cur = conn.cursor()
+        
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bets (
             id TEXT PRIMARY KEY,
@@ -46,11 +45,13 @@ def init_db():
         )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_created ON bets(created_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);")
+        
         cur.execute("""
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value REAL
         )""")
+        
         cur.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,14 +60,13 @@ def init_db():
             target_id TEXT,
             payload TEXT
         )""")
+        
         cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('bankroll', 10000.0)")
         cur.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('initial', 10000.0)")
         conn.commit()
 
 def log_audit(conn, action, target_id, payload):
-    """寫入審計日誌 (內部呼叫)"""
     ts = datetime.datetime.now(TZ_TAIPEI).isoformat()
-    # [FIX] 確保 payload 可以被 JSON 序列化
     conn.execute(
         "INSERT INTO audit_log (ts, action, target_id, payload) VALUES (?, ?, ?, ?)",
         (ts, action, target_id, json.dumps(payload, ensure_ascii=False, default=str)) 
@@ -112,17 +112,12 @@ def add_bet_db(match, bet_type, stake, odds, notes=""):
         return True, bet_id
 
 def settle_bet_db(bet_id, profit, status):
-    """結算注單 (修復 Decimal JSON Error)"""
     now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
-    
-    # [FIX] 強制轉為 float，避免 Decimal 導致 JSON 報錯
     profit_val = float(profit)
-
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
             cur.execute("BEGIN")
-            
             cur.execute("SELECT profit, status FROM bets WHERE id=?", (bet_id,))
             row = cur.fetchone()
             if not row: return False
@@ -139,8 +134,7 @@ def settle_bet_db(bet_id, profit, status):
             new_bank = current_bank - old_profit + profit_val
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (new_bank,))
             
-            # 使用轉換過的 profit_val
-            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit_val, "old_profit": old_profit})
+            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit_val})
             conn.commit()
             return True
         except Exception as e:
@@ -148,23 +142,18 @@ def settle_bet_db(bet_id, profit, status):
             raise e
 
 def revoke_settlement_db(bet_id):
-    """撤銷結算"""
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
             cur.execute("BEGIN")
-            
             cur.execute("SELECT profit FROM bets WHERE id=?", (bet_id,))
             row = cur.fetchone()
             if not row: return False
             profit_to_remove = row[0]
-            
             cur.execute("UPDATE bets SET status='待定', profit=0, settled_at=NULL WHERE id=?", (bet_id,))
-            
             cur.execute("SELECT value FROM config WHERE key='bankroll'")
             current_bank = cur.fetchone()[0]
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (current_bank - profit_to_remove,))
-            
             log_audit(conn, "REVOKE_SETTLE", bet_id, {"removed_profit": profit_to_remove})
             conn.commit()
             return True
@@ -186,11 +175,10 @@ def reset_system_db():
         log_audit(conn, "SYSTEM_RESET", "ALL", {})
         conn.commit()
 
-# 初始化
 init_db()
 
 # ==========================================
-# 🧠 2. 商業邏輯 (Decimal)
+# 🧠 2. 商業邏輯 (Decimal + Kelly + EV)
 # ==========================================
 def calculate_pnl(stake, odds, result_code):
     d_stake = Decimal(str(stake))
@@ -210,12 +198,33 @@ def calculate_max_drawdown(equity_curve):
     peak = equity_curve[0]
     max_dd = 0.0
     for value in equity_curve:
-        if value > peak:
-            peak = value
+        if value > peak: peak = value
         dd = (peak - value) / peak if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
+        if dd > max_dd: max_dd = dd
     return max_dd * 100
+
+# [NEW] 期望值與凱利公式
+def calculate_metrics(win_prob_percent, odds, fraction=0.25, bankroll=10000):
+    p = Decimal(str(win_prob_percent)) / Decimal('100')
+    o = Decimal(str(odds))
+    b = o - Decimal('1') # net odds
+    
+    # EV = p(b) - (1-p)
+    ev = (p * b) - (Decimal('1') - p)
+    
+    # Kelly
+    if b > 0:
+        k_full = p - ((Decimal('1') - p) / b)
+    else:
+        k_full = Decimal('0')
+    
+    # Fractional Kelly
+    k_frac = max(Decimal('0'), k_full * Decimal(str(fraction)))
+    
+    # Suggested Stake
+    s_stake = (k_frac * Decimal(str(bankroll))).quantize(Decimal('10'), rounding=ROUND_HALF_UP) # 取整到 10 元
+    
+    return ev, k_frac, s_stake
 
 # ==========================================
 # 🎨 3. UI 樣式 (鈦金版)
@@ -223,16 +232,13 @@ def calculate_max_drawdown(equity_curve):
 st.markdown("""
 <style>
     /* === 鈦金版全局配色 (Titanium Edition) === */
-    .stApp { 
-        background-color: #000000; 
-        color: #E5E7EB; 
-    }
+    .stApp { background-color: #000000; color: #E5E7EB; }
     
-    /* 頂部 HUD：改為黑金漸層 + 金色邊框 */
+    /* HUD */
     .hud-container {
         background: linear-gradient(135deg, #1C1917 0%, #292524 100%);
         border: 1px solid #44403C;
-        border-bottom: 4px solid #F59E0B; /* 琥珀金 */
+        border-bottom: 4px solid #F59E0B;
         border-radius: 4px;
         padding: 20px;
         margin-bottom: 25px;
@@ -240,80 +246,41 @@ st.markdown("""
         text-align: center;
         font-family: 'Helvetica Neue', sans-serif;
     }
-    .hud-title { 
-        font-size: 11px; 
-        color: #D97706; /* 暗金 */
-        letter-spacing: 2px; 
-        text-transform: uppercase; 
-        font-weight: 700;
-        margin-bottom: 5px;
-    }
-    .hud-value { 
-        font-size: 36px; 
-        font-weight: 900; 
-        color: #F3F4F6; 
-        text-shadow: 0 0 10px rgba(245, 158, 11, 0.3);
-    }
-    .hud-sub { 
-        font-size: 14px; 
-        color: #10B981; 
-        font-family: monospace; 
-        background: #064E3B;
-        padding: 2px 8px;
-        border-radius: 4px;
-        display: inline-block;
-        margin-top: 5px;
-    }
+    .hud-title { font-size: 11px; color: #D97706; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; margin-bottom: 5px; }
+    .hud-value { font-size: 36px; font-weight: 900; color: #F3F4F6; text-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
+    .hud-sub { font-size: 14px; color: #10B981; font-family: monospace; background: #064E3B; padding: 2px 8px; border-radius: 4px; display: inline-block; margin-top: 5px; }
     
-    /* 輸入框優化 */
-    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label { 
-        color: #D1D5DB !important; 
-        font-size: 14px;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
+    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label, .stSlider label { color: #D1D5DB !important; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
     
-    /* 按鈕樣式重寫 */
-    .stButton > button { 
-        width: 100%; 
-        border-radius: 2px;
-        height: 45px; 
-        font-weight: 700; 
-        border: 1px solid rgba(255,255,255,0.1); 
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        transition: all 0.2s;
-    }
+    .stButton > button { width: 100%; border-radius: 2px; height: 45px; font-weight: 700; border: 1px solid rgba(255,255,255,0.1); text-transform: uppercase; letter-spacing: 1px; transition: all 0.2s; }
     
-    /* 主行動按鈕：鈦金色 */
-    .primary-btn button { 
-        background: linear-gradient(to bottom, #F59E0B, #D97706) !important; 
-        color: #000000 !important; 
-        border: none !important;
-        box-shadow: 0 0 15px rgba(245, 158, 11, 0.4);
-    }
-    .primary-btn button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 0 20px rgba(245, 158, 11, 0.6);
-    }
+    .primary-btn button { background: linear-gradient(to bottom, #F59E0B, #D97706) !important; color: #000000 !important; border: none !important; box-shadow: 0 0 15px rgba(245, 158, 11, 0.4); }
+    .primary-btn button:hover { transform: translateY(-1px); box-shadow: 0 0 20px rgba(245, 158, 11, 0.6); }
     
-    /* 贏/輸按鈕 */
     .win-btn button { background-color: #065F46 !important; color: #D1FAE5 !important; border-left: 3px solid #10B981 !important; }
     .lose-btn button { background-color: #7F1D1D !important; color: #FEE2E2 !important; border-left: 3px solid #EF4444 !important; }
     .push-btn button { background-color: #78350F !important; color: #FEF3C7 !important; border-left: 3px solid #F59E0B !important; }
     .revoke-btn button { background-color: #262626 !important; color: #9CA3AF !important; border: 1px solid #404040 !important; font-size: 12px; }
 
-    /* Tabs */
     .stTabs [data-baseweb="tab-list"] { gap: 0px; }
     .stTabs [data-baseweb="tab"] { background-color: #000000; color: #525252; border-bottom: 1px solid #262626; padding: 15px 0; }
     .stTabs [aria-selected="true"] { color: #F59E0B !important; border-bottom: 2px solid #F59E0B; background-color: #1C1917; }
     
     [data-testid="stSidebar"] { background-color: #0A0A0A; border-right: 1px solid #262626; }
+    
+    /* 戰術分析區塊 */
+    .analysis-box {
+        background-color: #171717;
+        border: 1px solid #333;
+        padding: 15px;
+        border-radius: 4px;
+        margin-top: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🔒 4. GLOBAL_DB (資料庫定版)
+# 🔒 4. GLOBAL_DB
 # ==========================================
 GLOBAL_DB = {
     "[英] 英超 (Premier League)": ["曼城", "兵工廠", "利物浦", "阿斯頓維拉", "熱刺", "切爾西", "紐卡索聯", "曼聯", "西漢姆聯", "水晶宮", "布萊頓", "伯恩茅斯", "富勒姆", "狼隊", "艾佛頓", "布倫特福德", "諾丁漢森林", "萊斯特城", "伊普斯維奇", "南安普頓"],
@@ -380,7 +347,7 @@ with st.sidebar:
     st.download_button(
         label="📥 匯出資料庫 (JSON)",
         data=json.dumps(export_data, ensure_ascii=False, indent=2, default=str),
-        file_name=f"sniper_v8_backup.json",
+        file_name=f"sniper_v9_backup.json",
         mime="application/json"
     )
 
@@ -391,7 +358,7 @@ with st.sidebar:
         st.toast("系統已完全重置", icon="💥")
         st.rerun()
         
-    st.caption("Sniper Bet Pro v8.1 (Titanium Patch)")
+    st.caption("Sniper Bet Pro v9.0 (Quantum)")
 
 # ==========================================
 # 🖥️ 6. 主畫面
@@ -440,16 +407,47 @@ with tab1:
         with c2: val = st.selectbox("球數", ['0.5', '1.5', '2.5', '3.5', '4.5', '5.5', '6.5'])
         bet_content = f"大小 [{side} {val}]"
 
+    # [NEW] 戰術電腦：EV & Kelly
+    with st.expander("🧠 戰術電腦分析 (Tactical Computer)", expanded=True):
+        st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            win_prob = st.slider("預估勝率 (Win %)", 10, 95, 50, 5)
+        with ac2:
+            odds_input = st.number_input("賠率 (Odds)", value=1.90, step=0.01)
+        
+        # 計算
+        ev, k_frac, s_stake = calculate_metrics(win_prob, odds_input, fraction=0.25, bankroll=curr_bankroll)
+        
+        mc1, mc2, mc3 = st.columns(3)
+        
+        # EV Display
+        ev_color = "green" if ev > 0 else "red"
+        mc1.markdown(f"**EV 期望值**")
+        mc1.markdown(f":{ev_color}[{ev:.3f}]")
+        
+        # Kelly Display
+        mc2.markdown(f"**建議倉位**")
+        mc2.markdown(f"**{(k_frac*100):.1f}%**")
+        
+        # Stake Display
+        mc3.markdown(f"**建議金額**")
+        mc3.markdown(f"**${s_stake:,.0f}**")
+        
+        if ev <= 0:
+            st.warning("⚠️ 警告：負期望值交易 (Negative EV)")
+        if s_stake > (curr_bankroll * 0.05):
+            st.error(f"⚠️ 警告：建議金額過大 (>{(curr_bankroll*0.05):.0f})，請謹慎")
+            
+        st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown("---")
+    # 主下注區，讓使用者參考上面數據手動輸入
     c1, c2 = st.columns(2)
-    with c1: stake = st.number_input("投入金額", value=1000, step=100)
-    with c2: odds = st.number_input("賠率 (Odds)", value=1.90, step=0.01)
+    with c1: stake = st.number_input("確認投入金額", value=int(s_stake) if s_stake > 0 else 1000, step=100)
+    with c2: odds = st.number_input("確認賠率", value=odds_input, step=0.01)
     
     notes = st.text_input("戰術筆記 (選填)", placeholder="例如：主隊主力受傷，看好小球...")
-
-    if stake > 0 and odds > 1.0:
-        pot_win = calculate_pnl(stake, odds, "贏")
-        st.caption(f"🎯 預估獲利: :green[+${pot_win:,.2f}]")
 
     st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
     if st.button("🚀 LOCK IN BET (鎖定注單)"):
