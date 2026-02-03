@@ -9,9 +9,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 # ==========================================
-# ⚙️ 0. 核心設定
+# ⚙️ 0. 核心設定與常數
 # ==========================================
-DB_PATH = "sniper_v8.db"
+DB_PATH = "sniper_v9.db"
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
 st.set_page_config(
@@ -22,14 +22,15 @@ st.set_page_config(
 )
 
 # ==========================================
-# 🛠 1. 資料庫層 (維持 v8 架構，無需遷移)
+# 🛠 1. 資料庫層 (SQLite + WAL + Audit)
 # ==========================================
 def init_db():
+    """初始化資料庫結構 (含 WAL 優化與 Index)"""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        cur = conn.cursor()
         
+        cur = conn.cursor()
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bets (
             id TEXT PRIMARY KEY,
@@ -45,7 +46,11 @@ def init_db():
         )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_created ON bets(created_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);")
-        cur.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value REAL)")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value REAL
+        )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +64,9 @@ def init_db():
         conn.commit()
 
 def log_audit(conn, action, target_id, payload):
+    """寫入審計日誌 (內部呼叫)"""
     ts = datetime.datetime.now(TZ_TAIPEI).isoformat()
+    # 確保 payload 可以被 JSON 序列化 (處理 Decimal)
     conn.execute(
         "INSERT INTO audit_log (ts, action, target_id, payload) VALUES (?, ?, ?, ?)",
         (ts, action, target_id, json.dumps(payload, ensure_ascii=False, default=str)) 
@@ -85,6 +92,7 @@ def update_config(bankroll=None, initial=None):
 def add_bet_db(match, bet_type, stake, odds, notes=""):
     now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
     bet_id = str(uuid.uuid4())
+    
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -104,25 +112,33 @@ def add_bet_db(match, bet_type, stake, odds, notes=""):
         return True, bet_id
 
 def settle_bet_db(bet_id, profit, status):
+    """結算注單"""
     now_iso = datetime.datetime.now(TZ_TAIPEI).isoformat()
+    # [FIX] 強制轉為 float，避免 Decimal 導致 JSON 報錯
     profit_val = float(profit)
+
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
             cur.execute("BEGIN")
+            
             cur.execute("SELECT profit, status FROM bets WHERE id=?", (bet_id,))
             row = cur.fetchone()
             if not row: return False
             old_profit = row[0]
             
-            cur.execute("UPDATE bets SET status=?, profit=?, settled_at=? WHERE id=?", (status, profit_val, now_iso, bet_id))
+            cur.execute("""
+                UPDATE bets 
+                SET status=?, profit=?, settled_at=? 
+                WHERE id=?
+            """, (status, profit_val, now_iso, bet_id))
             
             cur.execute("SELECT value FROM config WHERE key='bankroll'")
             current_bank = cur.fetchone()[0]
             new_bank = current_bank - old_profit + profit_val
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (new_bank,))
             
-            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit_val})
+            log_audit(conn, "SETTLE_BET", bet_id, {"status": status, "profit": profit_val, "old_profit": old_profit})
             conn.commit()
             return True
         except Exception as e:
@@ -130,18 +146,23 @@ def settle_bet_db(bet_id, profit, status):
             raise e
 
 def revoke_settlement_db(bet_id):
+    """撤銷結算"""
     with sqlite3.connect(DB_PATH) as conn:
         try:
             cur = conn.cursor()
             cur.execute("BEGIN")
+            
             cur.execute("SELECT profit FROM bets WHERE id=?", (bet_id,))
             row = cur.fetchone()
             if not row: return False
             profit_to_remove = row[0]
+            
             cur.execute("UPDATE bets SET status='待定', profit=0, settled_at=NULL WHERE id=?", (bet_id,))
+            
             cur.execute("SELECT value FROM config WHERE key='bankroll'")
             current_bank = cur.fetchone()[0]
             cur.execute("UPDATE config SET value=? WHERE key='bankroll'", (current_bank - profit_to_remove,))
+            
             log_audit(conn, "REVOKE_SETTLE", bet_id, {"removed_profit": profit_to_remove})
             conn.commit()
             return True
@@ -163,20 +184,23 @@ def reset_system_db():
         log_audit(conn, "SYSTEM_RESET", "ALL", {})
         conn.commit()
 
+# 初始化 DB
 init_db()
 
 # ==========================================
-# 🧠 2. 商業邏輯 (EV反推勝率 + Kelly)
+# 🧠 2. 商業邏輯 (EV 百分比修復版)
 # ==========================================
 def calculate_pnl(stake, odds, result_code):
     d_stake = Decimal(str(stake))
     d_odds = Decimal(str(odds))
     d_profit = Decimal('0.0')
+
     if result_code == "贏": d_profit = d_stake * (d_odds - Decimal('1'))
     elif result_code == "贏半": d_profit = (d_stake * (d_odds - Decimal('1'))) / Decimal('2')
     elif result_code == "輸": d_profit = -d_stake
     elif result_code == "輸半": d_profit = -d_stake / Decimal('2')
     elif result_code == "走水": d_profit = Decimal('0.0')
+    
     return d_profit.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 def calculate_max_drawdown(equity_curve):
@@ -191,19 +215,19 @@ def calculate_max_drawdown(equity_curve):
 
 def calculate_reverse_metrics(ev_value, odds, fraction=0.25, bankroll=10000):
     """
-    [NEW] 核心算法更新：從 EV 反推 勝率
-    EV = P*Odds - 1  =>  P = (EV + 1) / Odds
+    [FIX] 支援直接輸入百分比 (例如 24.6)
+    邏輯：輸入值 / 100 = 實際小數
     """
-    ev = Decimal(str(ev_value))
+    ev = Decimal(str(ev_value)) / Decimal('100') # 修正點：除以100
     o = Decimal(str(odds))
     
-    # 1. 反推勝率 P
+    # 1. 反推勝率 P = (EV + 1) / Odds
     if o > 0:
         p = (ev + Decimal('1')) / o
     else:
         p = Decimal('0')
     
-    # 限制 P 在 0~1 之間 (防止錯誤輸入)
+    # 限制 P 在 0~1 之間
     p = max(Decimal('0'), min(Decimal('1'), p))
     
     # 2. 計算 Kelly
@@ -227,7 +251,6 @@ st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #E5E7EB; }
     
-    /* HUD */
     .hud-container {
         background: linear-gradient(135deg, #1C1917 0%, #292524 100%);
         border: 1px solid #44403C;
@@ -243,7 +266,7 @@ st.markdown("""
     .hud-value { font-size: 36px; font-weight: 900; color: #F3F4F6; text-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
     .hud-sub { font-size: 14px; color: #10B981; font-family: monospace; background: #064E3B; padding: 2px 8px; border-radius: 4px; display: inline-block; margin-top: 5px; }
     
-    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label, .stSlider label { color: #D1D5DB !important; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .stSelectbox label, .stNumberInput label, .stRadio label, .stTextInput label { color: #D1D5DB !important; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
     
     .stButton > button { width: 100%; border-radius: 2px; height: 45px; font-weight: 700; border: 1px solid rgba(255,255,255,0.1); text-transform: uppercase; letter-spacing: 1px; transition: all 0.2s; }
     .primary-btn button { background: linear-gradient(to bottom, #F59E0B, #D97706) !important; color: #000000 !important; border: none !important; box-shadow: 0 0 15px rgba(245, 158, 11, 0.4); }
@@ -260,19 +283,12 @@ st.markdown("""
     
     [data-testid="stSidebar"] { background-color: #0A0A0A; border-right: 1px solid #262626; }
     
-    /* 戰術分析區塊 */
-    .analysis-box {
-        background-color: #171717;
-        border: 1px solid #333;
-        padding: 15px;
-        border-radius: 4px;
-        margin-top: 10px;
-    }
+    .analysis-box { background-color: #171717; border: 1px solid #333; padding: 15px; border-radius: 4px; margin-top: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🔒 4. GLOBAL_DB
+# 🔒 4. GLOBAL_DB (定版)
 # ==========================================
 GLOBAL_DB = {
     "[英] 英超 (Premier League)": ["曼城", "兵工廠", "利物浦", "阿斯頓維拉", "熱刺", "切爾西", "紐卡索聯", "曼聯", "西漢姆聯", "水晶宮", "布萊頓", "伯恩茅斯", "富勒姆", "狼隊", "艾佛頓", "布倫特福德", "諾丁漢森林", "萊斯特城", "伊普斯維奇", "南安普頓"],
@@ -300,7 +316,7 @@ GLOBAL_DB = {
 }
 
 # ==========================================
-# 📱 5. 側邊欄 (設定與管理)
+# 📱 5. 側邊欄
 # ==========================================
 curr_bankroll, curr_initial = get_config()
 
@@ -316,14 +332,15 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown("### 📥 批次結算")
+    st.markdown("### 📥 批次結算 (Batch)")
     batch_file = st.file_uploader("上傳 CSV (id, result)", type=['csv'])
-    if batch_file and st.button("⚡ 執行批次"):
+    if batch_file and st.button("⚡ 執行批次結算"):
         try:
             df_batch = pd.read_csv(batch_file)
-            st.warning("功能需ID對應，僅作範例")
+            st.warning("批次功能需要對應的 ID 列表")
+            st.success(f"CSV 上傳成功，請確認 ID 正確")
         except:
-            st.error("格式錯誤")
+            st.error("CSV 格式錯誤")
 
     st.divider()
 
@@ -349,7 +366,7 @@ with st.sidebar:
         st.toast("系統已完全重置", icon="💥")
         st.rerun()
         
-    st.caption("Sniper Bet Pro v9.1 (Value Model)")
+    st.caption("Sniper Bet Pro v9.2 (Final Fix)")
 
 # ==========================================
 # 🖥️ 6. 主畫面
@@ -368,7 +385,7 @@ st.markdown(f"""
 
 tab1, tab2, tab3 = st.tabs(["📝 鎖定目標", "⚖️ 確認戰果", "📊 戰情室"])
 
-# === TAB 1: 下注 (含價值模型) ===
+# === TAB 1: 下注 ===
 with tab1:
     with st.container():
         league = st.selectbox("賽事區域 (League)", list(GLOBAL_DB.keys()))
@@ -398,52 +415,41 @@ with tab1:
         with c2: val = st.selectbox("球數", ['0.5', '1.5', '2.5', '3.5', '4.5', '5.5', '6.5'])
         bet_content = f"大小 [{side} {val}]"
 
-    # [NEW] 戰術電腦：價值模型 (EV/Sharpe Input -> Prob Output)
+    # [NEW] 戰術電腦
     with st.expander("🧠 戰術電腦分析 (Value Model)", expanded=True):
         st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
         ac1, ac2 = st.columns(2)
         with ac1:
             odds_input = st.number_input("賠率 (Odds)", value=1.90, step=0.01)
         with ac2:
-            # 這裡改為手動輸入 EV 與 Sharpe
-            ev_input = st.number_input("預期 EV (例如 0.05 代表 5%)", value=0.00, step=0.01)
+            # [FIX] 改為輸入百分比
+            ev_input = st.number_input("預期 EV (%)", value=5.0, step=0.1, format="%.1f")
             sharpe_input = st.number_input("夏普值 (Sharpe)", value=0.0, step=0.1)
         
-        # 核心算法：反推勝率
+        # 運算 (自動 / 100)
         implied_p, k_frac, s_stake = calculate_reverse_metrics(ev_input, odds_input, fraction=0.25, bankroll=curr_bankroll)
         
         mc1, mc2, mc3 = st.columns(3)
-        
-        # Win Prob (Calculated)
         mc1.markdown(f"**隱含勝率**")
         mc1.markdown(f":blue[{implied_p*100:.1f}%]")
-        
-        # Kelly Display
         mc2.markdown(f"**建議倉位**")
         mc2.markdown(f"**{(k_frac*100):.1f}%**")
-        
-        # Stake Display
         mc3.markdown(f"**建議金額**")
         mc3.markdown(f"**${s_stake:,.0f}**")
         
-        if ev_input < 0:
-            st.warning("⚠️ 警告：輸入為負 EV 交易")
-        if sharpe_input > 2.0:
-            st.success("🌟 高夏普值優質交易")
-            
+        if ev_input < 0: st.warning("⚠️ 警告：負 EV 交易")
+        if sharpe_input > 2.0: st.success("🌟 高夏普值優質交易")
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     c1, c2 = st.columns(2)
     with c1: 
-        # 自動帶入建議金額 (如果有的話)
         default_stake = int(s_stake) if s_stake > 0 else 1000
         stake = st.number_input("確認投入金額", value=default_stake, step=100)
     with c2: 
         odds = st.number_input("確認賠率", value=odds_input, step=0.01)
     
-    # [NEW] 自動將高階數據寫入備註
-    auto_notes = f"EV:{ev_input} | Sharpe:{sharpe_input} | P:{implied_p:.2f}"
+    auto_notes = f"EV:{ev_input}% | Sharpe:{sharpe_input} | P:{implied_p*100:.1f}%"
     notes = st.text_input("戰術筆記", value=auto_notes)
 
     st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
@@ -527,13 +533,11 @@ with tab3:
     df_all = get_all_bets()
     all_leagues = sorted(list(set([r.split(']')[0].replace('[', '') for r in df_all['match_info']]))) if not df_all.empty else []
     filter_lg = st.selectbox("Filter League", ["All"] + all_leagues)
-    
     if filter_lg != "All":
         df_all = df_all[df_all['match_info'].str.contains(filter_lg)]
 
     if not df_all.empty:
         df_settled = df_all[df_all['status'] != '待定'].copy()
-        
         if not df_settled.empty:
             df_settled['sort_time'] = pd.to_datetime(df_settled['settled_at'])
             df_settled = df_settled.sort_values('sort_time')
@@ -547,7 +551,6 @@ with tab3:
                 dates.append(r['sort_time'].strftime("%m/%d"))
             
             max_dd = calculate_max_drawdown(equity_curve)
-            
             st.line_chart(pd.DataFrame({'Equity': equity_curve}, index=dates))
             
             wins = len(df_settled[df_settled['profit'] > 0])
@@ -557,7 +560,7 @@ with tab3:
             
             c1, c2, c3 = st.columns(3)
             c1.metric("Win Rate", f"{win_rate:.1f}%")
-            c2.metric("Max Drawdown", f"{max_dd:.1f}%", help="最大回撤")
+            c2.metric("Max Drawdown", f"{max_dd:.1f}%")
             c3.metric("ROI", f"{roi:.1f}%")
         else:
             st.info("尚無結算數據")
